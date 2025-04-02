@@ -4,8 +4,10 @@ This is a discord bot utilizing ffmpeg and yt-dlp to download, processed, and pl
 # Bot Commands
 There are 6 commands currently usable to control the bot.
 1. /play
-2. /stop
-3. /pause
-4. /resume
-5. /skip
-6. /queue
+   Usage is /play "song_query", where song_query is then used to search youtube and pull the first result, then joining the
+   users channel and playing the request.
+3. /stop
+4. /pause
+5. /resume
+6. /skip
+7. /queue
