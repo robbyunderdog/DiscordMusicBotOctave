@@ -4,3 +4,8 @@ This is a discord bot utilizing ffmpeg and yt-dlp to download, processed, and pl
 # Bot Commands
 There are 6 commands currently usable to control the bot.
 1. /play
+2. /stop
+3. /pause
+4. /resume
+5. /skip
+6. /queue
