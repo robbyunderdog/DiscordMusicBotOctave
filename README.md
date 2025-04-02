@@ -8,10 +8,10 @@ Usage is /play "song_query", where song_query is then used to search youtube and
 ### /stop
 Usage is /stop, which clears the servers queue, stops playing the current track, then disconnects from the channel.
 ### /pause
-Usage is /pause, which pauses the currently playing track
+Usage is /pause, which pauses the currently playing track.
 ### /resume
-Usage is /play "song_query", where song_query is then used to search youtube and pull the first result, then joining the users channel and playing the request.
+Usage is /resume, which resumes the previously paused track.
 ### /skip
-Usage is /play "song_query", where song_query is then used to search youtube and pull the first result, then joining the users channel and playing the request.
+Usage is /skip, which moves onto the next track in the queue, if there is none after, the bot disconnects from the channel.
 ### /queue
-Usage is /play "song_query", where song_query is then used to search youtube and pull the first result, then joining the users channel and playing the request.
+Usage is /queue, which lists the currently playing track and any others that are in the queue.
