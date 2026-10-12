@@ -119,7 +119,7 @@ intents.message_content = True
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
-    activity=discord.Activity(type=discord.ActivityType.listening, name="a song"),
+    activity=discord.Activity(type=discord.ActivityType.custom, name="custom", state="🎧 Listening to Music."),
 )
 
 
