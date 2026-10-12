@@ -1,0 +1,9 @@
+services:
+  octave:
+    build: .
+    container_name: octave
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./cookies.txt:/app/cookies.txt

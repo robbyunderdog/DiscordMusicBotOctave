@@ -1,0 +1,9 @@
+.git
+.gitattributes
+.env
+cookies.txt
+dc_env/
+__pycache__/
+*.pyc
+bin/
+README.md

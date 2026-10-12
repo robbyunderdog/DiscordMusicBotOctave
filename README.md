@@ -21,3 +21,32 @@ The bot comes with six simple commands that are pretty self explanatory.
 
 ### /queue
 /queue shows the currently playing song, and any songs that are in the queue behind it.
+
+## Setup
+
+Create a `.env` file in the project root (never commit this file):
+
+```
+DISCORD_TOKEN=your-discord-bot-token
+```
+
+If you hit bot-check/age-restricted errors, export a YouTube `cookies.txt` (Netscape format) and drop it next to `Octave.py` — it's picked up automatically, no `.env` entry needed. To use a cookies file somewhere else instead, set `YTDLP_COOKIES_FILE=/path/to/cookies.txt` in `.env`.
+
+## Running with Docker
+
+```
+docker compose up -d --build
+```
+
+This builds the image (Python 3.12 + ffmpeg), starts the bot, and mounts `cookies.txt` into the container if present. View logs with `docker compose logs -f`, stop with `docker compose down`.
+
+## Running locally without Docker
+
+```
+pip install -r requirements.txt
+python Octave.py
+```
+
+ffmpeg must be installed and on your PATH, or point to it via the `FFMPEG_PATH` env var.
+
+Note: yt-dlp needs to stay up to date (`pip install -U yt-dlp`) since YouTube regularly changes its site in ways that break older extractor versions.
