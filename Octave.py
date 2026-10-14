@@ -28,6 +28,10 @@ YTDLP_USER_AGENT = os.getenv(
 # with FFMPEG_PATH for a specific binary location.
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 
+# Playback gain applied by ffmpeg, where 1.0 is the track's original level.
+# Override with OCTAVE_VOLUME to make the bot louder or quieter.
+VOLUME = float(os.getenv("OCTAVE_VOLUME", "0.5"))
+
 # Optional Netscape-format cookies.txt, used to avoid YouTube's
 # "sign in to confirm you're not a bot" checks on some videos. Set
 # YTDLP_COOKIES_FILE to an explicit path to override; otherwise, if a
@@ -315,7 +319,7 @@ async def play_next_song(voice_client, guild_id, channel, first_song=False):
     source = discord.FFmpegPCMAudio(
         stream_url,
         before_options=f'-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent "{YTDLP_USER_AGENT}"',
-        options="-vn -af volume=0.05",
+        options=f"-vn -af volume={VOLUME}",
         executable=FFMPEG_PATH,
     )
 
