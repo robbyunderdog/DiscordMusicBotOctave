@@ -1,9 +1,12 @@
 """Octave - a Discord bot that searches, queues, and plays YouTube audio in voice channels."""
 
 import os
+import sys
 import asyncio
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import discord
 from discord.ext import commands
@@ -43,10 +46,24 @@ YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE") or (
     str(_default_cookies_file) if _default_cookies_file.exists() else None
 )
 
-# Per-guild state: queue of (video_url, title) tuples waiting to play,
-# and the (video_url, title) currently playing.
-SONG_QUEUES = {}
-CURRENT_SONG = {}
+# Seconds to wait before leaving a voice channel that everyone else has left.
+AUTO_LEAVE_SECONDS = 15
+
+# Most songs queued from one playlist link, so a huge playlist can't flood the queue.
+MAX_PLAYLIST_SONGS = 100
+
+# Upcoming songs shown per page of the /queue embed.
+QUEUE_PAGE_SIZE = 10
+
+# Titles YouTube gives unavailable entries in a playlist; these can never play.
+UNAVAILABLE_TITLES = {"[Private video]", "[Deleted video]"}
+
+
+@dataclass
+class Song:
+    url: str
+    title: str
+    duration: Optional[int]  # seconds; None when unknown (e.g. livestreams)
 
 
 async def search_ytdlp_async(query, ydl_opts):
@@ -61,15 +78,20 @@ def _extract(query, ydl_opts):
 
 
 def build_search_ytdlp_options():
-    """Options for resolving a /play argument (URL or search text) to a video."""
+    """Options for resolving a /play argument (URL, playlist URL, or search text) to songs."""
     opts = {
         "format": "bestaudio/best",
+        # A watch URL that also carries &list= plays just that video; only a
+        # dedicated playlist URL queues the whole playlist.
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         # Only used when the query isn't already a URL.
         "default_search": "ytsearch1",
-        "extract_flat": False,
+        # Only read title/URL/duration for playlist and search entries;
+        # the actual stream is resolved later, when each song starts.
+        "extract_flat": "in_playlist",
+        "playlistend": MAX_PLAYLIST_SONGS,
         "http_headers": {
             "User-Agent": YTDLP_USER_AGENT,
         },
@@ -116,6 +138,300 @@ def pick_stream_url(info):
     return None
 
 
+def song_from_entry(entry):
+    """Build a Song from a yt-dlp video or flat playlist/search entry, or None if it's unplayable."""
+    url = entry.get("webpage_url") or entry.get("original_url") or entry.get("url")
+    title = entry.get("title") or "Untitled"
+    if not url or title in UNAVAILABLE_TITLES:
+        return None
+    duration = entry.get("duration")
+    return Song(url, title, int(duration) if duration else None)
+
+
+def format_duration(seconds):
+    """Format seconds as m:ss or h:mm:ss."""
+    if seconds is None:
+        return "--:--"
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02}:{secs:02}"
+    return f"{minutes}:{secs:02}"
+
+
+def shorten(text, limit=70):
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+class FFmpegLogFilter:
+    """Passes ffmpeg's stderr through to ours, minus known-harmless noise.
+
+    YouTube's Opus audio ends in a malformed final packet, so ffmpeg logs
+    "Error parsing Opus packet header" at the end of nearly every song even
+    though nothing audible is lost.
+    """
+
+    IGNORED = ("Error parsing Opus packet header",)
+
+    def __init__(self):
+        self._buffer = b""
+
+    def write(self, data):
+        # discord.py hands over raw chunks that can end mid-line, so only
+        # inspect complete lines and hold the remainder for the next chunk.
+        self._buffer += data
+        *lines, self._buffer = self._buffer.split(b"\n")
+        for line in lines:
+            text = line.decode(errors="replace").rstrip("\r")
+            if text and not any(ignored in text for ignored in self.IGNORED):
+                print(text, file=sys.stderr)
+
+
+class GuildPlayer:
+    """All music state and playback logic for one guild (server)."""
+
+    def __init__(self, guild):
+        self.guild = guild
+        self.queue = deque()      # Songs waiting to play
+        self.current = None       # Song playing (or loading) right now
+        self.text_channel = None  # where "Now playing" and similar messages go
+        self.loop_mode = "off"    # "off", "song", or "queue"
+        self._skip_requested = False
+        self._leave_task = None
+        # Bumped by reset(). Playback callbacks started before a reset see a
+        # different session and bail out instead of advancing the queue -
+        # this is what keeps /stop from triggering a second disconnect.
+        self._session = 0
+
+    @property
+    def voice_client(self):
+        return self.guild.voice_client
+
+    def is_busy(self):
+        return self.current is not None
+
+    def reset(self):
+        """Forget the queue, current song, and loop mode, without touching the voice connection."""
+        self._session += 1
+        self.queue.clear()
+        self.current = None
+        self.loop_mode = "off"
+        self._skip_requested = False
+        self.cancel_auto_leave()
+
+    async def stop(self):
+        """Clear everything and leave voice."""
+        self.reset()
+        voice_client = self.voice_client
+        if voice_client:
+            voice_client.stop()
+            await voice_client.disconnect()
+
+    def skip(self):
+        """Stop the current song so the next one starts. Returns False if nothing was playing."""
+        voice_client = self.voice_client
+        if not voice_client or not (voice_client.is_playing() or voice_client.is_paused()):
+            return False
+        # Song-loop mode should move on rather than replay the skipped song.
+        self._skip_requested = True
+        # Stopping playback triggers play_next via the after-play callback.
+        voice_client.stop()
+        return True
+
+    async def play_next(self, announce=True):
+        """Start the next song, applying loop mode and skipping songs that fail to load."""
+        session = self._session
+
+        finished, self.current = self.current, None
+        if finished is not None:
+            if self.loop_mode == "song" and not self._skip_requested:
+                self.queue.appendleft(finished)
+            elif self.loop_mode == "queue":
+                self.queue.append(finished)
+        self._skip_requested = False
+
+        # A loop rather than recursion, so a long run of dead songs (e.g.
+        # removed videos in a playlist) can't pile up nested calls.
+        while self.queue:
+            if self._session != session:
+                return
+
+            song = self.queue.popleft()
+            self.current = song
+
+            try:
+                # Re-resolve the video URL at play time (rather than reusing the
+                # URL found by /play) since stream URLs are signed and expire quickly.
+                info = await search_ytdlp_async(song.url, build_stream_ytdlp_options())
+                stream_url = pick_stream_url(info)
+                error = None if stream_url else "no playable stream found"
+            except Exception as e:
+                stream_url, error = None, str(e)
+
+            if self._session != session:
+                return  # /stop or a disconnect happened while this song was loading
+
+            if not stream_url:
+                # Dropped for good, even in loop mode, so a dead song can't repeat forever.
+                await self._send(f"Could not load **{song.title}**, skipping: `{error[:1500]}`")
+                continue
+
+            voice_client = self.voice_client
+            if voice_client is None:
+                self.current = None
+                return
+
+            print(f"Playing title: {song.title}")
+            print(f"Video URL: {song.url}")
+            print(f"Stream URL: {stream_url[:200]}...")
+
+            source = discord.FFmpegPCMAudio(
+                stream_url,
+                before_options=f'-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent "{YTDLP_USER_AGENT}"',
+                options=f"-vn -af volume={VOLUME}",
+                executable=FFMPEG_PATH,
+                stderr=FFmpegLogFilter(),
+            )
+            voice_client.play(source, after=lambda error: self._after_play(error, song, session))
+
+            # A looping song isn't re-announced on every repeat.
+            if announce and song is not finished:
+                await self._send(f"Now playing: **{song.title}** `{format_duration(song.duration)}`")
+            return
+
+        # Queue ran out. Leaving voice fires on_voice_state_update, which resets this player.
+        self.current = None
+        if self.voice_client:
+            await self.voice_client.disconnect()
+
+    def _after_play(self, error, song, session):
+        if error:
+            print(f"Error playing {song.title}: {error}")
+        if session != self._session:
+            return  # stopped by /stop or a disconnect, so there's nothing to advance
+        # We're on ffmpeg's playback thread here, so hop back onto the bot's
+        # event loop to advance the queue.
+        future = asyncio.run_coroutine_threadsafe(self.play_next(), bot.loop)
+        try:
+            future.result()
+        except Exception as exc:
+            print(f"Error advancing queue: {exc}")
+
+    def update_auto_leave(self):
+        """Start the auto-leave countdown if the bot is alone in its channel, or cancel it if not."""
+        voice_client = self.voice_client
+        alone = (
+            voice_client is not None
+            and voice_client.channel is not None
+            and not any(not member.bot for member in voice_client.channel.members)
+        )
+        if alone and self._leave_task is None:
+            self._leave_task = asyncio.create_task(self._leave_after_delay())
+        elif not alone:
+            self.cancel_auto_leave()
+
+    def cancel_auto_leave(self):
+        if self._leave_task is not None:
+            self._leave_task.cancel()
+            self._leave_task = None
+
+    async def _leave_after_delay(self):
+        await asyncio.sleep(AUTO_LEAVE_SECONDS)
+        self._leave_task = None
+        await self._send("Everyone left the voice channel, so I stopped playback and left too.")
+        await self.stop()
+
+    async def _send(self, message):
+        if self.text_channel is None:
+            return
+        try:
+            await self.text_channel.send(message)
+        except discord.HTTPException as e:
+            print(f"Failed to send message: {e}")
+
+
+# One GuildPlayer per guild id, created on first use.
+PLAYERS = {}
+
+
+def get_player(guild):
+    player = PLAYERS.get(guild.id)
+    if player is None:
+        player = PLAYERS[guild.id] = GuildPlayer(guild)
+    return player
+
+
+def queue_page_count(player):
+    return max(1, -(-len(player.queue) // QUEUE_PAGE_SIZE))
+
+
+def build_queue_embed(player, page=0):
+    embed = discord.Embed(title="Song Queue", color=discord.Color.blue())
+
+    if player.current:
+        now_playing = f"**{player.current.title}** `{format_duration(player.current.duration)}`"
+    else:
+        now_playing = "No song currently playing."
+    embed.add_field(name="Now Playing:", value=now_playing, inline=False)
+
+    songs = list(player.queue)
+    if not songs:
+        embed.add_field(name="Upcoming Songs", value="The queue is empty.", inline=False)
+    else:
+        start = page * QUEUE_PAGE_SIZE
+        queue_list = "\n".join(
+            f"**{idx}.** {shorten(song.title)} `{format_duration(song.duration)}`"
+            for idx, song in enumerate(songs[start : start + QUEUE_PAGE_SIZE], start=start + 1)
+        )
+        embed.add_field(name="Upcoming Songs", value=queue_list, inline=False)
+
+    total = format_duration(sum(song.duration or 0 for song in songs))
+    footer = f"{len(songs)} upcoming · {total} total · Loop: {player.loop_mode}"
+    pages = queue_page_count(player)
+    if pages > 1:
+        footer += f" · Page {page + 1}/{pages}"
+    embed.set_footer(text=footer)
+    return embed
+
+
+class QueueView(discord.ui.View):
+    """Previous/next buttons for paging through a long /queue embed."""
+
+    def __init__(self, player):
+        super().__init__(timeout=120)
+        self.player = player
+        self.page = 0
+        self.message = None
+
+    def build_embed(self):
+        # Re-read the live queue on every render, since songs may have
+        # finished or been added since the last button press.
+        pages = queue_page_count(self.player)
+        self.page = max(0, min(self.page, pages - 1))
+        self.previous_page.disabled = self.page == 0
+        self.next_page.disabled = self.page >= pages - 1
+        return build_queue_embed(self.player, self.page)
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.secondary)
+    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
 # Discord intents/bot setup.
 intents = discord.Intents.default()
 intents.message_content = True
@@ -133,9 +449,24 @@ async def on_ready():
     print(f"{bot.user} is online!")
 
 
+@bot.event
+async def on_voice_state_update(member, before, after):
+    player = PLAYERS.get(member.guild.id)
+    if player is None:
+        return
+
+    if member.id == bot.user.id and after.channel is None:
+        # The bot left voice - via /stop, the queue ending, auto-leave, or
+        # someone disconnecting it manually - so drop any leftover state.
+        player.reset()
+        return
+
+    player.update_auto_leave()
+
+
 # PLAY COMMAND
-@bot.tree.command(name="play", description="Play a song from a URL or search query, or add it to the queue.")
-@app_commands.describe(song_query="A YouTube URL, or a search query")
+@bot.tree.command(name="play", description="Play a song or YouTube playlist from a URL or search query, or add it to the queue.")
+@app_commands.describe(song_query="A YouTube video or playlist URL, or a search query")
 async def play(interaction: discord.Interaction, song_query: str):
     await interaction.response.defer()
 
@@ -152,12 +483,11 @@ async def play(interaction: discord.Interaction, song_query: str):
     elif voice_channel != voice_client.channel:
         await voice_client.move_to(voice_channel)
 
-    ydl_options = build_search_ytdlp_options()
-
     try:
         # yt-dlp detects whether song_query is a URL or plain search text itself,
-        # so the same call handles both "/play <url>" and "/play <search terms>".
-        results = await search_ytdlp_async(song_query, ydl_options)
+        # so the same call handles "/play <url>", "/play <playlist url>", and
+        # "/play <search terms>".
+        results = await search_ytdlp_async(song_query, build_search_ytdlp_options())
     except yt_dlp.utils.DownloadError as e:
         await interaction.followup.send(f"yt-dlp failed: `{str(e)[:1500]}`")
         return
@@ -165,67 +495,79 @@ async def play(interaction: discord.Interaction, song_query: str):
         await interaction.followup.send(f"Unexpected error while searching: `{str(e)[:1500]}`")
         return
 
-    # A search query returns {"entries": [...]}; a direct URL returns the
-    # video's info dict itself with no "entries" key.
-    if "entries" in results:
-        tracks = results.get("entries") or []
-        if not tracks:
-            await interaction.followup.send("No results found.")
-            return
-        track = tracks[0]
+    # Search text and playlist URLs both return {"entries": [...]}; a direct
+    # video URL returns the video's info dict itself with no "entries" key.
+    is_playlist = "entries" in results and results.get("extractor_key") != "YoutubeSearch"
+    if "entries" not in results:
+        entries = [results]
+    elif is_playlist:
+        entries = results.get("entries") or []
     else:
-        track = results
+        entries = (results.get("entries") or [])[:1]
 
-    video_url = track.get("webpage_url") or track.get("original_url") or track.get("url")
-    title = track.get("title", "Untitled")
-
-    if not video_url:
-        await interaction.followup.send("Could not get a playable result URL for that search.")
+    songs = [song for song in map(song_from_entry, entries) if song]
+    if not songs:
+        await interaction.followup.send("No results found.")
         return
 
-    guild_id = str(interaction.guild_id)
-    if guild_id not in SONG_QUEUES:
-        SONG_QUEUES[guild_id] = deque()
+    player = get_player(interaction.guild)
+    player.text_channel = interaction.channel
+    was_busy = player.is_busy()
+    player.queue.extend(songs)
 
-    SONG_QUEUES[guild_id].append((video_url, title))
-
-    if voice_client.is_playing() or voice_client.is_paused():
-        await interaction.followup.send(f"Added to queue: **{title}**")
+    if is_playlist:
+        message = f"Added **{len(songs)}** songs from **{results.get('title') or 'playlist'}** to the queue."
+        if len(entries) >= MAX_PLAYLIST_SONGS:
+            message += f" (Playlists are capped at {MAX_PLAYLIST_SONGS} songs.)"
+    elif was_busy:
+        message = f"Added to queue: **{songs[0].title}** `{format_duration(songs[0].duration)}`"
     else:
-        await interaction.followup.send(f"Now playing: **{title}**")
-        await play_next_song(voice_client, guild_id, interaction.channel, first_song=True)
+        message = f"Now playing: **{songs[0].title}** `{format_duration(songs[0].duration)}`"
+    await interaction.followup.send(message)
+
+    if not was_busy:
+        # A single song was already announced above; a playlist's first song wasn't.
+        await player.play_next(announce=is_playlist)
 
 
 # QUEUE COMMAND
 @bot.tree.command(name="queue", description="Displays the current song queue.")
 async def queue(interaction: discord.Interaction):
-    guild_id = str(interaction.guild_id)
-    embed = discord.Embed(title="Song Queue", color=discord.Color.blue())
+    player = get_player(interaction.guild)
 
-    if guild_id in CURRENT_SONG:
-        now_playing = CURRENT_SONG[guild_id][1]
-        embed.add_field(name="Now Playing:", value=f"**{now_playing}**", inline=False)
+    if queue_page_count(player) > 1:
+        view = QueueView(player)
+        await interaction.response.send_message(embed=view.build_embed(), view=view)
+        view.message = await interaction.original_response()
     else:
-        embed.add_field(name="Now Playing:", value="No song currently playing.", inline=False)
+        await interaction.response.send_message(embed=build_queue_embed(player))
 
-    if guild_id not in SONG_QUEUES or not SONG_QUEUES[guild_id]:
-        embed.add_field(name="Upcoming Songs", value="The queue is empty.", inline=False)
-    else:
-        queue_list = "\n".join(
-            f"**{idx}.** {title}" for idx, (_, title) in enumerate(SONG_QUEUES[guild_id], start=1)
-        )
-        embed.add_field(name="Upcoming Songs", value=queue_list, inline=False)
 
-    await interaction.response.send_message(embed=embed)
+# LOOP COMMAND
+@bot.tree.command(name="loop", description="Repeat the current song or the whole queue.")
+@app_commands.describe(mode="Off, Song (repeat the current song), or Queue (repeat the whole queue)")
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="Off", value="off"),
+        app_commands.Choice(name="Song", value="song"),
+        app_commands.Choice(name="Queue", value="queue"),
+    ]
+)
+async def loop(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+    player = get_player(interaction.guild)
+    player.loop_mode = mode.value
+    messages = {
+        "off": "Looping is off.",
+        "song": "Looping the current song.",
+        "queue": "Looping the whole queue.",
+    }
+    await interaction.response.send_message(messages[mode.value])
 
 
 # SKIP COMMAND
 @bot.tree.command(name="skip", description="Skips the current playing song")
 async def skip(interaction: discord.Interaction):
-    voice_client = interaction.guild.voice_client
-    if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
-        # Stopping playback triggers play_next_song via the after-play callback.
-        voice_client.stop()
+    if get_player(interaction.guild).skip():
         await interaction.response.send_message("Skipped the current song.")
     else:
         await interaction.response.send_message("Not playing anything to skip.")
@@ -270,77 +612,8 @@ async def stop(interaction: discord.Interaction):
     if not voice_client or not voice_client.is_connected():
         return await interaction.followup.send("I am not connected to any voice channel.")
 
-    guild_id = str(interaction.guild_id)
-    if guild_id in SONG_QUEUES:
-        SONG_QUEUES[guild_id].clear()
-
-    if voice_client.is_playing() or voice_client.is_paused():
-        voice_client.stop()
-
-    CURRENT_SONG.pop(guild_id, None)
-
     await interaction.followup.send("Stopped playback and disconnected.")
-    await voice_client.disconnect()
-
-
-async def play_next_song(voice_client, guild_id, channel, first_song=False):
-    """Pop the next queued song and play it; called again via after_play when it ends."""
-    if not SONG_QUEUES[guild_id]:
-        CURRENT_SONG.pop(guild_id, None)
-        await voice_client.disconnect()
-        SONG_QUEUES[guild_id] = deque()
-        return
-
-    video_url, title = SONG_QUEUES[guild_id].popleft()
-    CURRENT_SONG[guild_id] = (video_url, title)
-
-    ydl_options = build_stream_ytdlp_options()
-
-    try:
-        # Re-resolve the video URL at play time (rather than reusing the URL
-        # found by /play) since stream URLs are signed and expire quickly.
-        info = await search_ytdlp_async(video_url, ydl_options)
-        stream_url = pick_stream_url(info)
-
-        if not stream_url:
-            await channel.send(f"Could not get a playable stream for **{title}**.")
-            await play_next_song(voice_client, guild_id, channel)
-            return
-
-        print(f"Playing title: {title}")
-        print(f"Video URL: {video_url}")
-        print(f"Stream URL: {stream_url[:200]}...")
-
-    except Exception as e:
-        await channel.send(f"Failed to load **{title}**: `{str(e)[:1500]}`")
-        await play_next_song(voice_client, guild_id, channel)
-        return
-
-    source = discord.FFmpegPCMAudio(
-        stream_url,
-        before_options=f'-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -user_agent "{YTDLP_USER_AGENT}"',
-        options=f"-vn -af volume={VOLUME}",
-        executable=FFMPEG_PATH,
-    )
-
-    def after_play(error):
-        if error:
-            print(f"Error playing {title}: {error}")
-        # We're on ffmpeg's playback thread here, so hop back onto the bot's
-        # event loop to advance the queue.
-        future = asyncio.run_coroutine_threadsafe(
-            play_next_song(voice_client, guild_id, channel),
-            bot.loop,
-        )
-        try:
-            future.result()
-        except Exception as exc:
-            print(f"Error advancing queue: {exc}")
-
-    voice_client.play(source, after=after_play)
-
-    if not first_song:
-        asyncio.create_task(channel.send(f"Now playing: **{title}**"))
+    await get_player(interaction.guild).stop()
 
 
 bot.run(TOKEN)
